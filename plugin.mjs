@@ -1,9 +1,10 @@
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { createPreview } from './preview/index.mjs';
 import { prepareRuntime } from './runtime.mjs';
 
-export const name = 'dsh-chatgpt-computer-use';
+export const name = 'dsh-computer-use';
 export const inject = ['tools', 'approval', 'permissionPresets'];
 
 const bundledRoot = fileURLToPath(new URL('./cua_node/', import.meta.url));
@@ -11,8 +12,8 @@ const timeout = 120_000;
 const appApprovalPrefix = 'Allow Computer Use to use "';
 
 const exposed = new Map([
-  ['js', 'chatgpt_computer_use'],
-  ['js_reset', 'chatgpt_computer_use_reset'],
+  ['js', 'dsh_computer_use'],
+  ['js_reset', 'dsh_computer_use_reset'],
 ]);
 
 async function loadDshApis() {
@@ -29,30 +30,14 @@ async function loadDshApis() {
   return { Client, StdioClientTransport, createMcpToolDefinition };
 }
 
-function createSession(apis, ctx, runtime) {
-  const client = new apis.Client({ name: 'dsh-chatgpt-computer-use', version: '1.1.0' }, {
+function createSession(apis, ctx, runtime, preview) {
+  const client = new apis.Client({ name: 'dsh-chatgpt-computer-use', version: '1.2.0' }, {
     capabilities: { elicitation: { form: {} } },
     versionNegotiation: { mode: 'legacy' },
     supportedProtocolVersions: ['2025-11-25', '2025-06-18'],
   });
-  const transport = new apis.StdioClientTransport({
-    command: runtime.node,
-    args: [runtime.launcher],
-    cwd: runtime.root,
-    env: {
-      CUA_REPL_ENABLED_SURFACES: 'computer',
-      CUA_REPL_NODE_REPL_PATH: runtime.worker,
-      NODE_REPL_NODE_PATH: runtime.node,
-      NODE_REPL_NODE_MODULE_DIRS: runtime.modules,
-      NODE_REPL_TRUSTED_CODE_PATHS: runtime.modules,
-      SKY_CUA_SERVICE_PATH: runtime.helper,
-    },
-    stderr: 'pipe',
-  });
-  transport.stderr?.resume();
-
   const lifetime = new AbortController();
-  const session = { client, lifetime, active: undefined, closed: false };
+  const session = { client, lifetime, active: undefined, closed: false, observation: undefined };
   client.onclose = () => {
     session.closed = true;
     lifetime.abort();
@@ -93,13 +78,37 @@ function createSession(apis, ctx, runtime) {
     return { action: outcome === 'cancelled' ? 'cancel' : 'decline' };
   });
 
-  session.connect = () => client.connect(transport, {
-    signal: AbortSignal.any([lifetime.signal, AbortSignal.timeout(12_000)]),
-  });
+  session.connect = async () => {
+    const observation = await preview.open(runtime, session.active?.exec.agent.session.id).catch(error => {
+      ctx.logger.warn('DSH Computer Use preview is unavailable', error);
+    });
+    if (lifetime.signal.aborted) await observation?.close();
+    lifetime.signal.throwIfAborted();
+    session.observation = observation;
+    const transport = new apis.StdioClientTransport({
+      command: runtime.node,
+      args: [runtime.launcher],
+      cwd: runtime.root,
+      env: {
+        CUA_REPL_ENABLED_SURFACES: 'computer',
+        CUA_REPL_NODE_REPL_PATH: runtime.worker,
+        NODE_REPL_NODE_PATH: runtime.node,
+        NODE_REPL_NODE_MODULE_DIRS: runtime.modules,
+        NODE_REPL_TRUSTED_CODE_PATHS: runtime.modules,
+        SKY_CUA_SERVICE_PATH: runtime.helper,
+        ...observation?.env,
+      },
+      stderr: 'pipe',
+    });
+    transport.stderr?.resume();
+    await client.connect(transport, {
+      signal: AbortSignal.any([lifetime.signal, AbortSignal.timeout(12_000)]),
+    });
+  };
   session.close = async () => {
     lifetime.abort();
     session.closed = true;
-    await client.close();
+    await Promise.all([session.observation?.close(), client.close()]);
   };
   return session;
 }
@@ -107,6 +116,7 @@ function createSession(apis, ctx, runtime) {
 export async function apply(ctx) {
   const apis = await loadDshApis();
   const workers = new Map();
+  const preview = createPreview(ctx);
 
   const close = (agent) => {
     const session = workers.get(agent);
@@ -149,8 +159,8 @@ export async function apply(ctx) {
         name: publicName,
         rawName: upstreamName,
         description: isJs
-          ? 'Use ChatGPT Computer Use to inspect or operate native macOS apps. The first call returns API documentation. Use await cua.getApp with a bundle ID, or await cua.getState() to discover one. Full Access auto-approves application requests. Other approval-enabled modes ask the user. Run calls in order. First use may download the signed runtime from the official OpenAI installer.'
-          : 'Reset the ChatGPT Computer Use JavaScript state for this DSH turn.',
+          ? 'Use DSH Computer Use to inspect or operate native macOS apps. The first call returns API documentation. Use await cua.getApp with a bundle ID, or await cua.getState() to discover one. Full Access auto-approves application requests. Other approval-enabled modes ask the user. Run calls in order. First use may download the signed runtime from the official OpenAI installer.'
+          : 'Reset the DSH Computer Use JavaScript state for this DSH turn.',
         inputSchema: { type: 'object', properties, required: isJs ? ['code'] : [], additionalProperties: false },
         call: async (args, exec) => {
           const agent = exec.agent;
@@ -167,7 +177,7 @@ export async function apply(ctx) {
           }
           const opening = !session;
           if (!session) {
-            session = createSession(apis, ctx, runtime);
+            session = createSession(apis, ctx, runtime, preview);
             workers.set(agent, session);
           }
           if (session.active) throw new Error('Run ChatGPT Computer Use calls sequentially.');
@@ -206,5 +216,5 @@ export async function apply(ctx) {
     throw error;
   }
   ctx.effect(() => () => unregister.forEach(dispose => dispose()));
-  ctx.logger.info('ChatGPT Computer Use tools registered');
+  ctx.logger.info('DSH Computer Use tools registered');
 }
